@@ -1,0 +1,103 @@
+# AutoDance Lab
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 所有本地 Python 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+autodance_env/
+*_env/
+*.venv/
+
+# Conda、Pyenv 和环境管理文件
+.conda/
+conda-meta/
+.python-version
+Pipfile
+Pipfile.lock
+poetry.lock
+.pdm-python
+.pdm-build/
+__pypackages__/
+
+# 环境变量、密钥及本机配置
+.env
+.env.*
+!.env.example
+*.local
+secrets/
+secrets.*
+
+# Python 构建产物
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+
+# 测试和代码检查缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.ipynb_checkpoints/
+
+# 模型权重与推理缓存
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+*.torchscript
+.cache/
+runs/
+
+# AutoDance Lab 本地视频、中间数据和分析输出
+# data/.gitkeep 仍会保留在仓库中。
+data/runs/
+data/uploads/
+data/outputs/
+data/**/*.mp4
+data/**/*.avi
+data/**/*.mov
+data/**/*.mkv
+data/**/*.webm
+data/**/*.json
+data/**/*.log
+
+# Gradio 本地缓存
+.gradio/
+gradio_cached_examples/
+
+# 日志和临时文件
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+
+# IDE 和本机编辑器配置
+.idea/
+.vscode/
+*.code-workspace
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*~
+.directory
