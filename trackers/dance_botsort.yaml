@@ -1,0 +1,18 @@
+# AutoDance 固定机位多人舞蹈配置。
+# 低置信度检测用于续接已有轨迹，只有较可靠检测才能创建新轨迹。
+tracker_type: botsort
+track_high_thresh: 0.30
+track_low_thresh: 0.10
+new_track_thresh: 0.45
+track_buffer: 90
+match_thresh: 0.85
+fuse_score: true
+
+# 输入视频为固定机位；关闭全局运动补偿可避免舞者的大幅运动影响相机估计。
+gmc_method: none
+
+# 允许相邻/交叉人物使用外观特征辅助关联。
+proximity_thresh: 0.30
+appearance_thresh: 0.80
+with_reid: true
+model: auto

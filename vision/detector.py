@@ -1,5 +1,6 @@
 """人物检测与在线追踪封装。"""
 
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -10,16 +11,20 @@ from models import load_pose_model
 class PersonDetector:
     """使用 YOLO Pose 内置的 ByteTrack 或 BoT-SORT 完成人物检测与追踪。"""
 
+    _PROJECT_ROOT = Path(__file__).resolve().parent.parent
     TRACKER_CONFIGS = {
+        "Dance BoT-SORT": str(
+            _PROJECT_ROOT / "trackers" / "dance_botsort.yaml"
+        ),
         "ByteTrack": "bytetrack.yaml",
         "BoT-SORT": "botsort.yaml",
     }
 
     def __init__(
         self,
-        model_name: str = "yolo11n-pose.pt",
-        tracker_name: str = "ByteTrack",
-        confidence: float = 0.35,
+        model_name: str = "yolo11s-pose.pt",
+        tracker_name: str = "Dance BoT-SORT",
+        confidence: float = 0.10,
     ) -> None:
         """初始化检测器并校验追踪器名称。"""
 

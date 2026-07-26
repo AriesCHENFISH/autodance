@@ -11,11 +11,16 @@ import cv2
 import gradio as gr
 
 from vision import PersonDetector, draw_tracked_persons, extract_tracked_persons
+from vision import (
+    consolidate_track_ids,
+    extract_appearance_descriptor,
+    relabel_tracked_frames,
+)
 
 
 DATA_DIR = Path("data")
 RUNS_DIR = DATA_DIR / "runs"
-MODEL_NAME = "yolo11n-pose.pt"
+MODEL_NAME = "yolo11s-pose.pt"
 
 
 def _create_run_directory() -> Path:
@@ -80,6 +85,7 @@ def analyze_video(
     video_path: str | None,
     tracker_name: str,
     confidence: float,
+    expected_people: int = 5,
 ) -> tuple[str | None, str | None, str | None, str]:
     """分析上传视频并返回标注视频、tracks.json、日志和状态信息。"""
 
@@ -94,11 +100,20 @@ def analyze_video(
     capture: cv2.VideoCapture | None = None
     writer: cv2.VideoWriter | None = None
     frame_results: list[dict] = []
+    tracked_frames = []
+    final_tracked_frames = []
+    appearance_descriptors: dict[int, list] = {}
     failed_frames = 0
 
     try:
         logger.info("开始分析视频：%s", video_path)
-        logger.info("模型：%s，追踪器：%s，置信度：%.2f", MODEL_NAME, tracker_name, confidence)
+        logger.info(
+            "模型：%s，追踪器：%s，检测下限：%.2f，预期人数：%d",
+            MODEL_NAME,
+            tracker_name,
+            confidence,
+            expected_people,
+        )
 
         capture = cv2.VideoCapture(str(video_path))
         if not capture.isOpened():
@@ -114,7 +129,6 @@ def analyze_video(
         if width <= 0 or height <= 0:
             raise ValueError("无法读取视频画面尺寸")
 
-        writer = _open_video_writer(preview_path, fps, width, height)
         detector = PersonDetector(
             model_name=MODEL_NAME,
             tracker_name=tracker_name,
@@ -131,60 +145,111 @@ def analyze_video(
             try:
                 result = detector.process_frame(frame)
                 persons = extract_tracked_persons(result)
-                annotated_frame = draw_tracked_persons(frame, persons)
+                # 每三帧采样一次衣着特征，兼顾外观稳定性和 CPU 性能。
+                if frame_id % 3 == 0:
+                    for person in persons:
+                        descriptor = extract_appearance_descriptor(frame, person.box)
+                        if descriptor is not None:
+                            appearance_descriptors.setdefault(
+                                person.person_id, []
+                            ).append(descriptor)
             except Exception:
                 failed_frames += 1
                 logger.exception("第 %d 帧处理失败，已保留原始画面", frame_id)
-                annotated_frame = frame.copy()
-                cv2.putText(
-                    annotated_frame,
-                    "Tracking failed on this frame",
-                    (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (0, 0, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-
-            frame_results.append(
-                {
-                    "frame_id": frame_id,
-                    "timestamp": round(frame_id / fps, 3),
-                    "persons": [person.to_json() for person in persons],
-                }
-            )
-            writer.write(annotated_frame)
+            tracked_frames.append(persons)
             frame_id += 1
 
         if frame_id == 0:
             raise ValueError("视频中没有可读取的画面")
 
+        raw_unique_ids = {
+            person.person_id
+            for persons in tracked_frames
+            for person in persons
+        }
+        consolidation = consolidate_track_ids(
+            tracked_frames,
+            appearance_descriptors,
+            expected_count=int(expected_people),
+        )
+        final_tracked_frames = relabel_tracked_frames(
+            tracked_frames,
+            consolidation,
+        )
+        logger.info(
+            "身份归并：%d 个在线 ID -> %d 个最终 ID；锚点帧：%s；丢弃轨迹：%s；映射：%s",
+            consolidation.source_id_count,
+            consolidation.final_id_count,
+            consolidation.anchor_frame,
+            list(consolidation.dropped_ids),
+            consolidation.mapping,
+        )
+
+        frame_results = [
+            {
+                "frame_id": current_frame_id,
+                "timestamp": round(current_frame_id / fps, 3),
+                "persons": [person.to_json() for person in persons],
+            }
+            for current_frame_id, persons in enumerate(final_tracked_frames)
+        ]
         _save_tracks(tracks_path, frame_results)
+
+        # 身份归并完成后重新读取原视频，确保预览展示的是最终 1..N 编号。
+        capture.release()
+        capture = cv2.VideoCapture(str(video_path))
+        if not capture.isOpened():
+            raise RuntimeError("身份归并后无法重新打开原视频生成预览")
+        writer = _open_video_writer(preview_path, fps, width, height)
+        rendered_frames = 0
+        for persons in final_tracked_frames:
+            success, frame = capture.read()
+            if not success:
+                raise RuntimeError(
+                    f"生成最终预览时只能读取 {rendered_frames}/{frame_id} 帧"
+                )
+            writer.write(draw_tracked_persons(frame, persons))
+            rendered_frames += 1
+
         unique_ids = {
             person["id"]
             for frame_result in frame_results
             for person in frame_result["persons"]
         }
-        if len(unique_ids) < 4 or len(unique_ids) > 9:
+        if len(unique_ids) != int(expected_people):
             logger.warning(
-                "共出现 %d 个追踪 ID；目标视频通常应包含 4-9 人。ID 数量也可能受遮挡和换 ID 影响。",
+                "最终得到 %d 个身份，与预期人数 %d 不一致；请检查是否存在全程漏检。",
                 len(unique_ids),
+                expected_people,
             )
         logger.info(
-            "分析完成：读取 %d/%d 帧，出现 %d 个 ID，失败 %d 帧",
+            "分析完成：读取 %d/%d 帧，在线 ID %d 个，最终 ID %d 个，失败 %d 帧",
             frame_id,
             total_frames,
+            len(raw_unique_ids),
             len(unique_ids),
             failed_frames,
         )
         status = (
-            f"分析完成：共处理 {frame_id} 帧，检测到 {len(unique_ids)} 个追踪 ID，"
+            f"分析完成：共处理 {frame_id} 帧，在线跟踪产生 {len(raw_unique_ids)} 个 ID，"
+            f"已归并为 {len(unique_ids)} 个最终人物 ID，"
             f"单帧处理失败 {failed_frames} 次。所有结果保存在 `{run_directory}`。"
         )
         return str(preview_path), str(tracks_path), str(log_path), status
     except Exception as error:
         logger.error("分析任务失败：%s\n%s", error, traceback.format_exc())
+        if not frame_results:
+            fallback_frames = final_tracked_frames or tracked_frames
+            frame_results = [
+                {
+                    "frame_id": current_frame_id,
+                    "timestamp": round(current_frame_id / fps, 3)
+                    if "fps" in locals() and fps > 0
+                    else 0.0,
+                    "persons": [person.to_json() for person in persons],
+                }
+                for current_frame_id, persons in enumerate(fallback_frames)
+            ]
         _save_tracks(tracks_path, frame_results)
         status = f"分析未能完成：{error}。已保留部分 JSON 和错误日志。"
         return (
@@ -218,16 +283,23 @@ def build_app() -> gr.Blocks:
             with gr.Column():
                 video_input = gr.Video(label="上传舞蹈视频")
                 tracker_input = gr.Radio(
-                    choices=["ByteTrack", "BoT-SORT"],
-                    value="ByteTrack",
+                    choices=["Dance BoT-SORT", "ByteTrack", "BoT-SORT"],
+                    value="Dance BoT-SORT",
                     label="追踪器",
                 )
                 confidence_input = gr.Slider(
-                    minimum=0.1,
+                    minimum=0.05,
                     maximum=0.9,
-                    value=0.35,
+                    value=0.10,
                     step=0.05,
-                    label="人物检测置信度",
+                    label="送入追踪器的最低检测置信度",
+                )
+                expected_people_input = gr.Slider(
+                    minimum=1,
+                    maximum=12,
+                    value=5,
+                    step=1,
+                    label="视频中的固定人数",
                 )
                 analyze_button = gr.Button("开始分析", variant="primary")
             with gr.Column():
@@ -238,7 +310,12 @@ def build_app() -> gr.Blocks:
 
         analyze_button.click(
             fn=analyze_video,
-            inputs=[video_input, tracker_input, confidence_input],
+            inputs=[
+                video_input,
+                tracker_input,
+                confidence_input,
+                expected_people_input,
+            ],
             outputs=[preview_output, tracks_output, log_output, status_output],
         )
     return demo
