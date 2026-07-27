@@ -1,5 +1,6 @@
 """视频视觉处理模块。"""
 
+from .coordinate import CalibrationError, StageCalibration, StagePoint
 from .detector import PersonDetector
 from .identity import (
     IdentityConsolidation,
@@ -10,11 +11,14 @@ from .identity import (
 from .tracker import TrackedPerson, draw_tracked_persons, extract_tracked_persons
 
 __all__ = [
+    "CalibrationError",
     "consolidate_track_ids",
     "extract_appearance_descriptor",
     "IdentityConsolidation",
     "PersonDetector",
     "relabel_tracked_frames",
+    "StageCalibration",
+    "StagePoint",
     "TrackedPerson",
     "draw_tracked_persons",
     "extract_tracked_persons",
