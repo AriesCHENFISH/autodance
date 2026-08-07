@@ -16,6 +16,7 @@ class TrackedPerson:
     x: float
     y: float
     box: tuple[int, int, int, int]
+    confidence: float | None = None
 
     def to_json(self) -> dict[str, int]:
         """转换为 tracks.json 要求的精简字段。"""
@@ -85,6 +86,7 @@ def extract_tracked_persons(result: Any) -> list[TrackedPerson]:
 
     boxes_xyxy = _to_numpy(boxes.xyxy)
     track_ids = _to_numpy(boxes.id)
+    confidences = _to_numpy(getattr(boxes, "conf", None))
     keypoints = getattr(result, "keypoints", None)
     keypoints_xy = _to_numpy(keypoints.xy) if keypoints is not None else None
     keypoints_conf = _to_numpy(keypoints.conf) if keypoints is not None else None
@@ -98,6 +100,11 @@ def extract_tracked_persons(result: Any) -> list[TrackedPerson]:
                 x=x,
                 y=y,
                 box=tuple(round(float(value)) for value in box),
+                confidence=(
+                    float(confidences[index])
+                    if confidences is not None and index < len(confidences)
+                    else None
+                ),
             )
         )
     return sorted(persons, key=lambda person: person.person_id)

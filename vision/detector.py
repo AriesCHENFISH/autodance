@@ -25,6 +25,8 @@ class PersonDetector:
         model_name: str = "yolo11s-pose.pt",
         tracker_name: str = "Dance BoT-SORT",
         confidence: float = 0.10,
+        image_size: int = 640,
+        iou_threshold: float = 0.70,
     ) -> None:
         """初始化检测器并校验追踪器名称。"""
 
@@ -33,6 +35,8 @@ class PersonDetector:
         self.model = load_pose_model(model_name)
         self.tracker_config = self.TRACKER_CONFIGS[tracker_name]
         self.confidence = confidence
+        self.image_size = int(image_size)
+        self.iou_threshold = float(iou_threshold)
 
     def process_frame(self, frame: np.ndarray) -> Any:
         """处理单帧图像，返回包含追踪 ID、检测框和关键点的结果。"""
@@ -43,6 +47,8 @@ class PersonDetector:
             tracker=self.tracker_config,
             classes=[0],
             conf=self.confidence,
+            imgsz=self.image_size,
+            iou=self.iou_threshold,
             verbose=False,
         )
         if not results:

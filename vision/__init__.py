@@ -2,6 +2,7 @@
 
 from .coordinate import CalibrationError, StageCalibration, StagePoint
 from .detector import PersonDetector
+from .identity import FixedIdentityAssignment, assign_fixed_identities
 from .identity import (
     IdentityConsolidation,
     consolidate_track_ids,
@@ -16,6 +17,8 @@ __all__ = [
     "extract_appearance_descriptor",
     "IdentityConsolidation",
     "PersonDetector",
+    "FixedIdentityAssignment",
+    "assign_fixed_identities",
     "relabel_tracked_frames",
     "StageCalibration",
     "StagePoint",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from itertools import combinations, permutations
 import math
 
 import cv2
@@ -88,6 +89,27 @@ class IdentityConsolidation:
     final_id_count: int
 
 
+@dataclass(frozen=True)
+class FixedIdentityAssignment:
+    """逐帧固定身份分配的诊断结果。"""
+
+    anchor_frame: int | None
+    final_id_count: int
+    source_switches: dict[int, int]
+    mean_assignment_cost: float
+
+
+@dataclass
+class _IdentityState:
+    """一个最终身份在单向时间遍历中的外观和运动状态。"""
+
+    final_id: int
+    prototype: np.ndarray | None
+    last_point: tuple[float, float]
+    last_frame: int
+    last_source_id: int
+
+
 def extract_appearance_descriptor(
     frame: np.ndarray,
     box: tuple[int, int, int, int],
@@ -126,6 +148,292 @@ def extract_appearance_descriptor(
     if norm <= 1e-12:
         return None
     return (histogram / norm).astype(np.float32)
+
+
+def _box_iou(
+    left: tuple[int, int, int, int],
+    right: tuple[int, int, int, int],
+) -> float:
+    """计算两个检测框的交并比。"""
+
+    left_x = max(left[0], right[0])
+    top_y = max(left[1], right[1])
+    right_x = min(left[2], right[2])
+    bottom_y = min(left[3], right[3])
+    intersection = max(0, right_x - left_x) * max(0, bottom_y - top_y)
+    left_area = max(0, left[2] - left[0]) * max(0, left[3] - left[1])
+    right_area = max(0, right[2] - right[0]) * max(0, right[3] - right[1])
+    union = left_area + right_area - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def _select_clean_anchor(
+    tracked_frames: list[list[TrackedPerson]],
+    frame_descriptors: list[dict[int, np.ndarray]],
+    expected_count: int,
+) -> int | None:
+    """选择人数齐全、框重叠少且检测置信度高的身份锚点帧。"""
+
+    candidates: list[tuple[float, int]] = []
+    for frame_id, persons in enumerate(tracked_frames):
+        if len(persons) != expected_count:
+            continue
+        if any(
+            person.person_id not in frame_descriptors[frame_id]
+            for person in persons
+        ):
+            continue
+        overlaps = [
+            _box_iou(left.box, right.box)
+            for index, left in enumerate(persons)
+            for right in persons[index + 1 :]
+        ]
+        max_overlap = max(overlaps, default=0.0)
+        mean_confidence = float(
+            np.mean(
+                [
+                    person.confidence
+                    if person.confidence is not None
+                    else 0.5
+                    for person in persons
+                ]
+            )
+        )
+        # 优先无遮挡帧，再用检测置信度打破相近候选的平局。
+        score = mean_confidence - max_overlap * 2.0
+        candidates.append((score, frame_id))
+    return max(candidates, default=(0.0, None), key=lambda item: item[0])[1]
+
+
+def _identity_pair_cost(
+    person: TrackedPerson,
+    descriptor: np.ndarray | None,
+    state: _IdentityState,
+    frame_id: int,
+    frame_diagonal: float,
+) -> float:
+    """综合衣着、运动、在线 ID 连续性和检测置信度计算匹配代价。"""
+
+    appearance = _appearance_distance(descriptor, state.prototype)
+    gap = max(1, abs(frame_id - state.last_frame))
+    distance = math.dist((person.x, person.y), state.last_point)
+    motion_scale = frame_diagonal * (0.035 + min(gap, 15) * 0.012)
+    motion = min(distance / max(motion_scale, 1.0), 2.0)
+    source_penalty = 0.0 if person.person_id == state.last_source_id else 1.0
+    confidence_penalty = 1.0 - (
+        person.confidence if person.confidence is not None else 0.5
+    )
+    return (
+        appearance * 0.70
+        + motion * 0.20
+        + source_penalty * 0.06
+        + confidence_penalty * 0.04
+    )
+
+
+def _best_frame_assignment(
+    persons: list[TrackedPerson],
+    descriptors: dict[int, np.ndarray],
+    states: dict[int, _IdentityState],
+    frame_id: int,
+    frame_diagonal: float,
+) -> tuple[list[tuple[int, int, float]], float]:
+    """穷举小规模一对一匹配，允许漏检或从重复框中只选择固定人数。"""
+
+    identity_ids = sorted(states)
+    expected_count = len(identity_ids)
+    if not persons or not identity_ids:
+        return [], 0.0
+
+    if len(persons) <= expected_count:
+        detection_subsets = [tuple(range(len(persons)))]
+        identity_orders = permutations(identity_ids, len(persons))
+        candidates = (
+            (detection_indices, identity_order)
+            for detection_indices in detection_subsets
+            for identity_order in identity_orders
+        )
+    else:
+        candidates = (
+            (detection_indices, identity_order)
+            for detection_indices in combinations(
+                range(len(persons)), expected_count
+            )
+            for identity_order in permutations(identity_ids)
+        )
+
+    best_pairs: list[tuple[int, int, float]] = []
+    best_cost = math.inf
+    for detection_indices, identity_order in candidates:
+        pairs = []
+        total_cost = 0.0
+        for detection_index, identity_id in zip(
+            detection_indices, identity_order
+        ):
+            person = persons[detection_index]
+            cost = _identity_pair_cost(
+                person,
+                descriptors.get(person.person_id),
+                states[identity_id],
+                frame_id,
+                frame_diagonal,
+            )
+            pairs.append((detection_index, identity_id, cost))
+            total_cost += cost
+        if total_cost < best_cost:
+            best_pairs = pairs
+            best_cost = total_cost
+    return best_pairs, best_cost
+
+
+def _assign_direction(
+    frame_ids,
+    tracked_frames: list[list[TrackedPerson]],
+    frame_descriptors: list[dict[int, np.ndarray]],
+    initial_states: dict[int, _IdentityState],
+    frame_diagonal: float,
+    output_frames: list[list[TrackedPerson]],
+    source_histories: dict[int, list[int]],
+    costs: list[float],
+) -> None:
+    """从锚点向一个时间方向逐帧分配最终身份。"""
+
+    states = {
+        identity_id: _IdentityState(
+            state.final_id,
+            state.prototype.copy() if state.prototype is not None else None,
+            state.last_point,
+            state.last_frame,
+            state.last_source_id,
+        )
+        for identity_id, state in initial_states.items()
+    }
+    for frame_id in frame_ids:
+        persons = tracked_frames[frame_id]
+        pairs, total_cost = _best_frame_assignment(
+            persons,
+            frame_descriptors[frame_id],
+            states,
+            frame_id,
+            frame_diagonal,
+        )
+        assigned: list[TrackedPerson] = []
+        if pairs:
+            costs.append(total_cost / len(pairs))
+        for detection_index, identity_id, pair_cost in pairs:
+            person = persons[detection_index]
+            descriptor = frame_descriptors[frame_id].get(person.person_id)
+            state = states[identity_id]
+            assigned.append(replace(person, person_id=identity_id))
+            source_histories[identity_id].append(person.person_id)
+
+            max_overlap = max(
+                (
+                    _box_iou(person.box, other.box)
+                    for index, other in enumerate(persons)
+                    if index != detection_index
+                ),
+                default=0.0,
+            )
+            confidence = person.confidence if person.confidence is not None else 0.5
+            appearance = _appearance_distance(descriptor, state.prototype)
+            if (
+                descriptor is not None
+                and max_overlap < 0.20
+                and confidence >= 0.50
+                and appearance < 0.40
+                and pair_cost < 0.80
+            ):
+                prototype = state.prototype * 0.95 + descriptor * 0.05
+                norm = float(np.linalg.norm(prototype))
+                if norm > 1e-12:
+                    state.prototype = prototype / norm
+            state.last_point = (person.x, person.y)
+            state.last_frame = frame_id
+            state.last_source_id = person.person_id
+        output_frames[frame_id] = sorted(
+            assigned, key=lambda person: person.person_id
+        )
+
+
+def assign_fixed_identities(
+    tracked_frames: list[list[TrackedPerson]],
+    frame_descriptors: list[dict[int, np.ndarray]],
+    expected_count: int,
+    frame_width: int,
+    frame_height: int,
+) -> tuple[list[list[TrackedPerson]], FixedIdentityAssignment]:
+    """以干净锚点为基准，向前后逐帧分配固定且唯一的人物身份。"""
+
+    if expected_count < 1:
+        raise ValueError("expected_count 必须大于 0")
+    if len(frame_descriptors) != len(tracked_frames):
+        raise ValueError("外观特征帧数必须与追踪帧数一致")
+    anchor_frame = _select_clean_anchor(
+        tracked_frames, frame_descriptors, expected_count
+    )
+    if anchor_frame is None:
+        empty = [[] for _frame in tracked_frames]
+        return empty, FixedIdentityAssignment(None, 0, {}, 0.0)
+
+    anchor_people = sorted(
+        tracked_frames[anchor_frame], key=lambda person: person.x
+    )
+    output_frames: list[list[TrackedPerson]] = [
+        [] for _frame in tracked_frames
+    ]
+    output_frames[anchor_frame] = [
+        replace(person, person_id=index + 1)
+        for index, person in enumerate(anchor_people)
+    ]
+    states = {
+        index + 1: _IdentityState(
+            final_id=index + 1,
+            prototype=frame_descriptors[anchor_frame].get(person.person_id),
+            last_point=(person.x, person.y),
+            last_frame=anchor_frame,
+            last_source_id=person.person_id,
+        )
+        for index, person in enumerate(anchor_people)
+    }
+    source_histories = {
+        identity_id: [state.last_source_id]
+        for identity_id, state in states.items()
+    }
+    costs: list[float] = []
+    frame_diagonal = math.hypot(frame_width, frame_height)
+    _assign_direction(
+        range(anchor_frame + 1, len(tracked_frames)),
+        tracked_frames,
+        frame_descriptors,
+        states,
+        frame_diagonal,
+        output_frames,
+        source_histories,
+        costs,
+    )
+    _assign_direction(
+        range(anchor_frame - 1, -1, -1),
+        tracked_frames,
+        frame_descriptors,
+        states,
+        frame_diagonal,
+        output_frames,
+        source_histories,
+        costs,
+    )
+    switches = {
+        identity_id: sum(
+            left != right for left, right in zip(history, history[1:])
+        )
+        for identity_id, history in source_histories.items()
+    }
+    return output_frames, FixedIdentityAssignment(
+        anchor_frame=anchor_frame,
+        final_id_count=len(states),
+        source_switches=switches,
+        mean_assignment_cost=round(float(np.mean(costs)), 5) if costs else 0.0,
+    )
 
 
 def _build_tracklets(
