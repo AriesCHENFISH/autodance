@@ -119,7 +119,9 @@ def color_for_id(person_id: int) -> tuple[int, int, int]:
 
 
 def draw_tracked_persons(
-    frame: np.ndarray, persons: list[TrackedPerson]
+    frame: np.ndarray,
+    persons: list[TrackedPerson],
+    draw_position: bool = True,
 ) -> np.ndarray:
     """在视频帧上绘制人物框、落脚点和追踪编号。"""
 
@@ -129,7 +131,8 @@ def draw_tracked_persons(
         x1, y1, x2, y2 = person.box
         cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
         point = (round(person.x), round(person.y))
-        cv2.circle(annotated, point, 5, color, -1, lineType=cv2.LINE_AA)
+        if draw_position:
+            cv2.circle(annotated, point, 5, color, -1, lineType=cv2.LINE_AA)
 
         label = f"ID {person.person_id}"
         (text_width, text_height), _ = cv2.getTextSize(

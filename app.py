@@ -12,14 +12,16 @@ import gradio as gr
 import numpy as np
 
 from formation import (
-    draw_grid_positions,
     draw_perspective_grid,
+    draw_stabilized_grid_positions,
     person_to_grid_json,
+    stabilize_grid_tracks,
 )
 from vision import (
     CalibrationError,
     PersonDetector,
     StageCalibration,
+    assign_fixed_identities,
     draw_tracked_persons,
     extract_tracked_persons,
 )
@@ -33,6 +35,8 @@ from vision import (
 DATA_DIR = Path("data")
 RUNS_DIR = DATA_DIR / "runs"
 MODEL_NAME = "yolo11s-pose.pt"
+INFERENCE_IMAGE_SIZE = 960
+INFERENCE_IOU_THRESHOLD = 0.50
 GRID_COLUMNS = 9
 GRID_ROWS = 9
 CALIBRATION_LABELS = ("左上", "右上", "右下", "左下")
@@ -77,6 +81,22 @@ def _save_tracks(
 
     with output_path.open("w", encoding="utf-8") as file:
         json.dump(frames, file, ensure_ascii=False, indent=2)
+
+
+def _raw_person_json(person) -> dict:
+    """保存离线归并前的在线 ID、脚点、检测框和置信度。"""
+
+    return {
+        "online_id": person.person_id,
+        "x": round(person.x, 3),
+        "y": round(person.y, 3),
+        "box": list(person.box),
+        "confidence": (
+            round(person.confidence, 5)
+            if person.confidence is not None
+            else None
+        ),
+    }
 
 
 def _read_first_video_frame(video_path: str) -> np.ndarray:
@@ -274,14 +294,16 @@ def analyze_video(
     str | None,
     str | None,
     str | None,
+    str | None,
     str,
 ]:
     """分析视频并返回预览、轨迹、标定、日志和状态信息。"""
 
     if not video_path:
-        return None, None, None, None, "请先上传一个 MP4 视频。"
+        return None, None, None, None, None, "请先上传一个 MP4 视频。"
     if calibration_points is None or len(calibration_points) != 4:
         return (
+            None,
             None,
             None,
             None,
@@ -291,6 +313,7 @@ def analyze_video(
 
     run_directory = _create_run_directory()
     tracks_path = run_directory / "tracks.json"
+    raw_tracks_path = run_directory / "raw_tracks.json"
     calibration_path = run_directory / "calibration.json"
     preview_path = run_directory / "tracked_preview.mp4"
     log_path = run_directory / "analysis.log"
@@ -300,7 +323,7 @@ def analyze_video(
     frame_results: list[dict] = []
     tracked_frames = []
     final_tracked_frames = []
-    appearance_descriptors: dict[int, list] = {}
+    frame_descriptors: list[dict] = []
     failed_frames = 0
 
     try:
@@ -347,6 +370,8 @@ def analyze_video(
             model_name=MODEL_NAME,
             tracker_name=tracker_name,
             confidence=float(confidence),
+            image_size=INFERENCE_IMAGE_SIZE,
+            iou_threshold=INFERENCE_IOU_THRESHOLD,
         )
 
         frame_id = 0
@@ -356,21 +381,19 @@ def analyze_video(
                 break
 
             persons = []
+            descriptors = {}
             try:
                 result = detector.process_frame(frame)
                 persons = extract_tracked_persons(result)
-                # 每三帧采样一次衣着特征，兼顾外观稳定性和 CPU 性能。
-                if frame_id % 3 == 0:
-                    for person in persons:
-                        descriptor = extract_appearance_descriptor(frame, person.box)
-                        if descriptor is not None:
-                            appearance_descriptors.setdefault(
-                                person.person_id, []
-                            ).append(descriptor)
+                for person in persons:
+                    descriptor = extract_appearance_descriptor(frame, person.box)
+                    if descriptor is not None:
+                        descriptors[person.person_id] = descriptor
             except Exception:
                 failed_frames += 1
                 logger.exception("第 %d 帧处理失败，已保留原始画面", frame_id)
             tracked_frames.append(persons)
+            frame_descriptors.append(descriptors)
             frame_id += 1
 
         if frame_id == 0:
@@ -381,23 +404,60 @@ def analyze_video(
             for persons in tracked_frames
             for person in persons
         }
-        consolidation = consolidate_track_ids(
+        raw_frame_results = [
+            {
+                "frame_id": current_frame_id,
+                "timestamp": round(current_frame_id / fps, 3),
+                "persons": [
+                    _raw_person_json(person) for person in persons
+                ],
+            }
+            for current_frame_id, persons in enumerate(tracked_frames)
+        ]
+        _save_tracks(raw_tracks_path, raw_frame_results)
+
+        final_tracked_frames, fixed_assignment = assign_fixed_identities(
             tracked_frames,
-            appearance_descriptors,
             expected_count=int(expected_people),
+            frame_descriptors=frame_descriptors,
+            frame_width=width,
+            frame_height=height,
         )
-        final_tracked_frames = relabel_tracked_frames(
-            tracked_frames,
-            consolidation,
-        )
-        logger.info(
-            "身份归并：%d 个在线 ID -> %d 个最终 ID；锚点帧：%s；丢弃轨迹：%s；映射：%s",
-            consolidation.source_id_count,
-            consolidation.final_id_count,
-            consolidation.anchor_frame,
-            list(consolidation.dropped_ids),
-            consolidation.mapping,
-        )
+        if fixed_assignment.final_id_count == int(expected_people):
+            logger.info(
+                "固定身份分配：%d 个在线 ID -> %d 个最终 ID；锚点帧：%s；"
+                "在线来源切换：%s；平均代价：%.5f",
+                len(raw_unique_ids),
+                fixed_assignment.final_id_count,
+                fixed_assignment.anchor_frame,
+                fixed_assignment.source_switches,
+                fixed_assignment.mean_assignment_cost,
+            )
+        else:
+            logger.warning(
+                "没有找到人数齐全的干净锚点，降级使用轨迹片段归并。"
+            )
+            appearance_descriptors: dict[int, list] = {}
+            for descriptors in frame_descriptors:
+                for source_id, descriptor in descriptors.items():
+                    appearance_descriptors.setdefault(source_id, []).append(
+                        descriptor
+                    )
+            consolidation = consolidate_track_ids(
+                tracked_frames,
+                appearance_descriptors,
+                expected_count=int(expected_people),
+            )
+            final_tracked_frames = relabel_tracked_frames(
+                tracked_frames,
+                consolidation,
+            )
+            logger.info(
+                "降级身份归并：%d 个在线 ID -> %d 个最终 ID；映射：%s",
+                consolidation.source_id_count,
+                consolidation.final_id_count,
+                consolidation.mapping,
+            )
 
         frame_results = [
             {
@@ -410,6 +470,26 @@ def analyze_video(
             }
             for current_frame_id, persons in enumerate(final_tracked_frames)
         ]
+        frame_results = stabilize_grid_tracks(
+            frame_results,
+            columns=GRID_COLUMNS,
+            rows=GRID_ROWS,
+        )
+        interpolated_positions = sum(
+            person.get("interpolated", False)
+            for frame_result in frame_results
+            for person in frame_result["persons"]
+        )
+        unresolved_positions = sum(
+            not person.get("in_stage", False)
+            for frame_result in frame_results
+            for person in frame_result["persons"]
+        )
+        logger.info(
+            "坐标稳定：插值修复 %d 个人次，仍越界 %d 个人次",
+            interpolated_positions,
+            unresolved_positions,
+        )
         _save_tracks(tracks_path, frame_results)
 
         # 身份归并完成后重新读取原视频，确保预览展示的是最终 1..N 编号。
@@ -419,15 +499,21 @@ def analyze_video(
             raise RuntimeError("身份归并后无法重新打开原视频生成预览")
         writer = _open_video_writer(preview_path, fps, width, height)
         rendered_frames = 0
-        for persons in final_tracked_frames:
+        for current_frame_id, persons in enumerate(final_tracked_frames):
             success, frame = capture.read()
             if not success:
                 raise RuntimeError(
                     f"生成最终预览时只能读取 {rendered_frames}/{frame_id} 帧"
                 )
             annotated = draw_perspective_grid(frame, calibration)
-            annotated = draw_tracked_persons(annotated, persons)
-            annotated = draw_grid_positions(annotated, persons, calibration)
+            annotated = draw_tracked_persons(
+                annotated, persons, draw_position=False
+            )
+            annotated = draw_stabilized_grid_positions(
+                annotated,
+                frame_results[current_frame_id],
+                calibration,
+            )
             writer.write(annotated)
             rendered_frames += 1
 
@@ -459,6 +545,7 @@ def analyze_video(
         return (
             str(preview_path),
             str(tracks_path),
+            str(raw_tracks_path),
             str(calibration_path),
             str(log_path),
             status,
@@ -482,6 +569,7 @@ def analyze_video(
         return (
             str(preview_path) if frame_results and preview_path.exists() else None,
             str(tracks_path),
+            str(raw_tracks_path) if raw_tracks_path.exists() else None,
             str(calibration_path) if calibration_path.exists() else None,
             str(log_path),
             status,
@@ -547,6 +635,7 @@ def build_app() -> gr.Blocks:
                 preview_output = gr.Video(label="带 ID 的追踪视频")
                 status_output = gr.Markdown()
                 tracks_output = gr.File(label="下载 tracks.json")
+                raw_tracks_output = gr.File(label="下载 raw_tracks.json（诊断）")
                 calibration_output = gr.File(label="下载 calibration.json")
                 log_output = gr.File(label="下载 analysis.log")
 
@@ -590,6 +679,7 @@ def build_app() -> gr.Blocks:
             outputs=[
                 preview_output,
                 tracks_output,
+                raw_tracks_output,
                 calibration_output,
                 log_output,
                 status_output,

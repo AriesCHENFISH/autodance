@@ -9,6 +9,7 @@ from formation.grid import (
     draw_perspective_grid,
     locate_on_grid,
     person_to_grid_json,
+    stabilize_grid_tracks,
 )
 from vision.coordinate import CalibrationError, StageCalibration
 from vision.tracker import TrackedPerson
@@ -96,6 +97,34 @@ class StageCalibrationTests(unittest.TestCase):
 
         self.assertEqual(rendered.shape, frame.shape)
         self.assertGreater(int(cv2.countNonZero(cv2.cvtColor(rendered, cv2.COLOR_BGR2GRAY))), 0)
+
+    def test_short_outlier_is_interpolated(self) -> None:
+        frames = [
+            {
+                "frame_id": index,
+                "timestamp": index / 24,
+                "persons": [
+                    {
+                        "id": 1,
+                        "x": 100,
+                        "y": 100,
+                        "stage_x": 4.0,
+                        "stage_y": -8.0 if index == 2 else 4.0,
+                        "grid_col": None if index == 2 else 5,
+                        "grid_row": None if index == 2 else 5,
+                        "in_stage": index != 2,
+                    }
+                ],
+            }
+            for index in range(5)
+        ]
+
+        stabilized = stabilize_grid_tracks(frames, 9, 9)
+
+        repaired = stabilized[2]["persons"][0]
+        self.assertEqual(repaired["stage_y"], 4.0)
+        self.assertTrue(repaired["in_stage"])
+        self.assertTrue(repaired["interpolated"])
 
 
 if __name__ == "__main__":
