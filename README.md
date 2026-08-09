@@ -36,7 +36,7 @@ AutoDance Lab 是一个本地运行的舞蹈队形分析工具。当前包含 **
 
 ```bash
 cd autodance
-python -m venv .venv
+.\autodance_env\Scripts\Activate.ps1
 ```
 
 Linux / macOS 激活环境：
