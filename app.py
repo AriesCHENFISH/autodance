@@ -1,4 +1,4 @@
-"""AutoDance Lab 人物追踪、透视标定和舞台网格映射入口。"""
+"""AutoDance Lab 人物追踪、队形检测、编辑与 SVG 导出入口。"""
 
 from datetime import datetime
 import json
@@ -30,6 +30,21 @@ from vision import (
     consolidate_track_ids,
     extract_appearance_descriptor,
     relabel_tracked_frames,
+)
+from visualization import (
+    FormationValidationError,
+    canvas_to_grid,
+    delete_formation,
+    duplicate_formation,
+    formation_label,
+    move_person,
+    normalize_formations,
+    persons_to_rows,
+    render_editor_canvas,
+    render_formation_svg,
+    selected_index,
+    update_formation,
+    write_formation_exports,
 )
 
 
@@ -265,6 +280,207 @@ def reset_calibration(
     if original_rgb is None:
         return None, [], "请先上传视频。"
     return original_rgb.copy(), [], "已清空；请点击第 1 个点：舞台左上角。"
+
+
+def _uploaded_path(value: object) -> Path:
+    """兼容 Gradio File 返回的字符串、Path 和临时文件对象。"""
+
+    if isinstance(value, (str, Path)):
+        return Path(value)
+    name = getattr(value, "name", None)
+    if name:
+        return Path(name)
+    if isinstance(value, dict):
+        candidate = value.get("path") or value.get("name")
+        if candidate:
+            return Path(candidate)
+    raise FormationValidationError("请选择 formations.json 文件")
+
+
+def _editor_payload(
+    formations: list[dict],
+    index: int,
+    status: str,
+) -> tuple:
+    formation = formations[index]
+    labels = [formation_label(item) for item in formations]
+    selected_label = labels[index]
+    person_ids = [int(person["id"]) for person in formation["persons"]]
+    selected_person = person_ids[0]
+    return (
+        gr.Dropdown(choices=labels, value=selected_label),
+        formation["name"],
+        formation["time"],
+        gr.Dropdown(choices=person_ids, value=selected_person),
+        persons_to_rows(formation),
+        render_editor_canvas(formation, selected_person),
+        render_formation_svg(formation),
+        status,
+    )
+
+
+def _empty_editor_payload(status: str) -> tuple:
+    return (
+        gr.Dropdown(choices=[], value=None),
+        "",
+        0,
+        gr.Dropdown(choices=[], value=None),
+        [],
+        None,
+        "",
+        status,
+    )
+
+
+def load_formation_editor(source: object) -> tuple:
+    """加载 Phase 3 JSON，初始化 Phase 4 编辑器。"""
+
+    try:
+        path = _uploaded_path(source)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        formations = normalize_formations(payload)
+        return (
+            formations,
+            *_editor_payload(
+                formations,
+                0,
+                f"已加载 {len(formations)} 个关键队形。选择人物后可点击画布移动。",
+            ),
+        )
+    except Exception as error:
+        return [], *_empty_editor_payload(f"加载失败：{error}")
+
+
+def select_editor_formation(label: str, formations: list[dict]) -> tuple:
+    try:
+        index = selected_index(formations, label)
+        return _editor_payload(formations, index, f"正在编辑队形 {index + 1}。")
+    except Exception as error:
+        return _empty_editor_payload(f"选择失败：{error}")
+
+
+def apply_formation_edits(
+    formations: list[dict],
+    label: str,
+    name: str,
+    time: float,
+    person_table: object,
+) -> tuple:
+    try:
+        index = selected_index(formations, label)
+        updated = update_formation(formations, index, name, time, person_table)
+        return updated, *_editor_payload(updated, index, "当前队形修改已应用。")
+    except Exception as error:
+        if not formations:
+            return formations, *_empty_editor_payload(f"应用失败：{error}")
+        index = selected_index(formations, label)
+        return formations, *_editor_payload(formations, index, f"应用失败：{error}")
+
+
+def move_selected_person(
+    formations: list[dict],
+    label: str,
+    name: str,
+    time: float,
+    person_table: object,
+    person_id: int,
+    event: gr.SelectData,
+) -> tuple:
+    """先吸收表格编辑，再把所选人物移动到点击的最近格点。"""
+
+    try:
+        index = selected_index(formations, label)
+        updated = update_formation(formations, index, name, time, person_table)
+        if not isinstance(event.index, (tuple, list)) or len(event.index) < 2:
+            raise FormationValidationError("没有读取到有效画布坐标")
+        x, y = canvas_to_grid(updated[index], event.index[0], event.index[1])
+        updated = move_person(updated, index, int(person_id), x, y)
+        formation = updated[index]
+        return (
+            updated,
+            persons_to_rows(formation),
+            render_editor_canvas(formation, int(person_id)),
+            render_formation_svg(formation),
+            f"人物 {int(person_id)} 已移动到 ({x}, {y})。",
+        )
+    except Exception as error:
+        if not formations:
+            return formations, [], None, "", f"移动失败：{error}"
+        index = selected_index(formations, label)
+        return (
+            formations,
+            persons_to_rows(formations[index]),
+            render_editor_canvas(formations[index], int(person_id)),
+            render_formation_svg(formations[index]),
+            f"移动失败：{error}",
+        )
+
+
+def highlight_editor_person(
+    formations: list[dict], label: str, person_id: int
+) -> np.ndarray | None:
+    try:
+        index = selected_index(formations, label)
+        return render_editor_canvas(formations[index], int(person_id))
+    except Exception:
+        return None
+
+
+def duplicate_editor_formation(
+    formations: list[dict], label: str
+) -> tuple:
+    try:
+        index = selected_index(formations, label)
+        updated = duplicate_formation(formations, index)
+        return updated, *_editor_payload(updated, index + 1, "已复制为新队形。")
+    except Exception as error:
+        if not formations:
+            return formations, *_empty_editor_payload(f"复制失败：{error}")
+        index = selected_index(formations, label)
+        return formations, *_editor_payload(formations, index, f"复制失败：{error}")
+
+
+def delete_editor_formation(
+    formations: list[dict], label: str
+) -> tuple:
+    try:
+        index = selected_index(formations, label)
+        updated = delete_formation(formations, index)
+        next_index = min(index, len(updated) - 1)
+        return updated, *_editor_payload(updated, next_index, "当前队形已删除。")
+    except Exception as error:
+        if not formations:
+            return formations, *_empty_editor_payload(f"删除失败：{error}")
+        index = selected_index(formations, label)
+        return formations, *_editor_payload(formations, index, f"删除失败：{error}")
+
+
+def save_formation_editor(
+    formations: list[dict],
+    label: str,
+    name: str,
+    time: float,
+    person_table: object,
+) -> tuple[str | None, str | None, str | None, str]:
+    """应用未保存编辑并导出 JSON、当前 SVG 和全量 ZIP。"""
+
+    try:
+        index = selected_index(formations, label)
+        updated = update_formation(formations, index, name, time, person_table)
+        export_directory = DATA_DIR / "outputs" / (
+            datetime.now().strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:8]
+        )
+        json_path, svg_path, zip_path = write_formation_exports(
+            updated, export_directory, index
+        )
+        return (
+            str(json_path),
+            str(svg_path),
+            str(zip_path),
+            f"已导出 {len(updated)} 个队形到 `{export_directory}`。",
+        )
+    except Exception as error:
+        return None, None, None, f"导出失败：{error}"
 
 
 def _open_video_writer(
@@ -621,13 +837,13 @@ def analyze_video(
 
 
 def build_app() -> gr.Blocks:
-    """构建 AutoDance Lab Phase 1–3 的 Gradio 页面。"""
+    """构建 AutoDance Lab Phase 1–4 的 Gradio 页面。"""
 
     with gr.Blocks(title="AutoDance Lab") as demo:
         gr.Markdown(
             """
             # AutoDance Lab
-            **Phase 1–3：人物追踪、透视标定与关键队形检测**
+            **Phase 1–4：人物追踪、关键队形检测、编辑与 SVG 导出**
 
             上传视频后，在首帧按 **左上 → 右上 → 右下 → 左下** 点击舞台四角。
             系统会输出最终人物 ID、舞台坐标、带透视网格的预览视频，以及按
@@ -636,6 +852,7 @@ def build_app() -> gr.Blocks:
         )
         calibration_frame_state = gr.State()
         calibration_points_state = gr.State([])
+        formation_editor_state = gr.State([])
         with gr.Row():
             with gr.Column():
                 video_input = gr.Video(label="上传舞蹈视频")
@@ -694,6 +911,68 @@ def build_app() -> gr.Blocks:
                 calibration_output = gr.File(label="下载 calibration.json")
                 log_output = gr.File(label="下载 analysis.log")
 
+        gr.Markdown(
+            """
+            ## Phase 4：队形编辑与 SVG
+
+            分析完成后会自动载入关键队形；也可以单独上传已有的
+            `formations.json`。选择人物后点击画布可移动到最近格点，或直接修改
+            坐标表。点击“应用修改”后再切换队形。
+            """
+        )
+        with gr.Row():
+            with gr.Column(scale=2):
+                formation_import_input = gr.File(
+                    label="载入 formations.json",
+                    file_types=[".json"],
+                )
+                load_formations_button = gr.Button("载入队形")
+                formation_selector = gr.Dropdown(
+                    choices=[], label="当前队形"
+                )
+                with gr.Row():
+                    formation_name_input = gr.Textbox(label="队形名称")
+                    formation_time_input = gr.Number(
+                        label="展示时间（秒）", minimum=0
+                    )
+                person_selector = gr.Dropdown(
+                    choices=[], label="点击画布时要移动的人物 ID"
+                )
+                person_table = gr.Dataframe(
+                    headers=["ID", "X", "Y"],
+                    datatype=["number", "number", "number"],
+                    row_count=(1, "dynamic"),
+                    column_count=3,
+                    interactive=True,
+                    label="人物格位（可直接编辑）",
+                )
+                with gr.Row():
+                    apply_formation_button = gr.Button(
+                        "应用修改", variant="primary"
+                    )
+                    duplicate_formation_button = gr.Button("复制为新队形")
+                    delete_formation_button = gr.Button(
+                        "删除当前队形", variant="stop"
+                    )
+                editor_status = gr.Markdown("尚未载入关键队形。")
+            with gr.Column(scale=3):
+                editor_canvas = gr.Image(
+                    label="选择人物后点击目标格点",
+                    type="numpy",
+                    interactive=False,
+                )
+                svg_preview = gr.HTML(label="SVG 预览")
+
+        save_formations_button = gr.Button(
+            "保存并导出 SVG", variant="primary"
+        )
+        with gr.Row():
+            edited_formations_output = gr.File(
+                label="下载 formations_edited.json"
+            )
+            selected_svg_output = gr.File(label="下载当前队形 SVG")
+            all_svgs_output = gr.File(label="下载全部 SVG（ZIP）")
+
         video_input.change(
             fn=prepare_calibration,
             inputs=[video_input],
@@ -722,7 +1001,87 @@ def build_app() -> gr.Blocks:
                 calibration_status,
             ],
         )
-        analyze_button.click(
+        editor_outputs = [
+            formation_selector,
+            formation_name_input,
+            formation_time_input,
+            person_selector,
+            person_table,
+            editor_canvas,
+            svg_preview,
+            editor_status,
+        ]
+        load_formations_button.click(
+            fn=load_formation_editor,
+            inputs=[formation_import_input],
+            outputs=[formation_editor_state, *editor_outputs],
+        )
+        formation_selector.input(
+            fn=select_editor_formation,
+            inputs=[formation_selector, formation_editor_state],
+            outputs=editor_outputs,
+        )
+        apply_formation_button.click(
+            fn=apply_formation_edits,
+            inputs=[
+                formation_editor_state,
+                formation_selector,
+                formation_name_input,
+                formation_time_input,
+                person_table,
+            ],
+            outputs=[formation_editor_state, *editor_outputs],
+        )
+        duplicate_formation_button.click(
+            fn=duplicate_editor_formation,
+            inputs=[formation_editor_state, formation_selector],
+            outputs=[formation_editor_state, *editor_outputs],
+        )
+        delete_formation_button.click(
+            fn=delete_editor_formation,
+            inputs=[formation_editor_state, formation_selector],
+            outputs=[formation_editor_state, *editor_outputs],
+        )
+        person_selector.input(
+            fn=highlight_editor_person,
+            inputs=[formation_editor_state, formation_selector, person_selector],
+            outputs=[editor_canvas],
+        )
+        editor_canvas.select(
+            fn=move_selected_person,
+            inputs=[
+                formation_editor_state,
+                formation_selector,
+                formation_name_input,
+                formation_time_input,
+                person_table,
+                person_selector,
+            ],
+            outputs=[
+                formation_editor_state,
+                person_table,
+                editor_canvas,
+                svg_preview,
+                editor_status,
+            ],
+        )
+        save_formations_button.click(
+            fn=save_formation_editor,
+            inputs=[
+                formation_editor_state,
+                formation_selector,
+                formation_name_input,
+                formation_time_input,
+                person_table,
+            ],
+            outputs=[
+                edited_formations_output,
+                selected_svg_output,
+                all_svgs_output,
+                editor_status,
+            ],
+        )
+        analysis_event = analyze_button.click(
             fn=analyze_video,
             inputs=[
                 video_input,
@@ -742,6 +1101,11 @@ def build_app() -> gr.Blocks:
                 log_output,
                 status_output,
             ],
+        )
+        analysis_event.then(
+            fn=load_formation_editor,
+            inputs=[formations_output],
+            outputs=[formation_editor_state, *editor_outputs],
         )
     return demo
 
