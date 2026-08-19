@@ -1,5 +1,7 @@
 """舞台网格和队形分析模块。"""
 
+from .analyzer import analyze_formations
+
 from .grid import (
     GridPosition,
     draw_grid_positions,
@@ -11,6 +13,7 @@ from .grid import (
 )
 
 __all__ = [
+    "analyze_formations",
     "draw_grid_positions",
     "draw_perspective_grid",
     "draw_stabilized_grid_positions",

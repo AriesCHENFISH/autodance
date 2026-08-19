@@ -12,6 +12,7 @@ import gradio as gr
 import numpy as np
 
 from formation import (
+    analyze_formations,
     draw_perspective_grid,
     draw_stabilized_grid_positions,
     person_to_grid_json,
@@ -288,6 +289,8 @@ def analyze_video(
     tracker_name: str,
     confidence: float,
     expected_people: int = 5,
+    formation_grid_width: int = 20,
+    formation_grid_height: int = 20,
     calibration_points: list | None = None,
 ) -> tuple[
     str | None,
@@ -295,12 +298,13 @@ def analyze_video(
     str | None,
     str | None,
     str | None,
+    str | None,
     str,
 ]:
-    """分析视频并返回预览、轨迹、标定、日志和状态信息。"""
+    """分析视频并返回预览、轨迹、队形、标定、日志和状态信息。"""
 
     if not video_path:
-        return None, None, None, None, None, "请先上传一个 MP4 视频。"
+        return None, None, None, None, None, None, "请先上传一个 MP4 视频。"
     if calibration_points is None or len(calibration_points) != 4:
         return (
             None,
@@ -308,11 +312,17 @@ def analyze_video(
             None,
             None,
             None,
+            None,
             "请先按左上、右上、右下、左下顺序完成四点透视标定。",
         )
+    formation_grid_width = int(formation_grid_width)
+    formation_grid_height = int(formation_grid_height)
+    if not 8 <= formation_grid_width <= 40 or not 8 <= formation_grid_height <= 40:
+        return None, None, None, None, None, None, "队形网格宽度和高度必须在 8 到 40 之间。"
 
     run_directory = _create_run_directory()
     tracks_path = run_directory / "tracks.json"
+    formations_path = run_directory / "formations.json"
     raw_tracks_path = run_directory / "raw_tracks.json"
     calibration_path = run_directory / "calibration.json"
     preview_path = run_directory / "tracked_preview.mp4"
@@ -329,11 +339,14 @@ def analyze_video(
     try:
         logger.info("开始分析视频：%s", video_path)
         logger.info(
-            "模型：%s，追踪器：%s，检测下限：%.2f，预期人数：%d",
+            "模型：%s，追踪器：%s，检测下限：%.2f，预期人数：%d，"
+            "队形网格：%dx%d",
             MODEL_NAME,
             tracker_name,
             confidence,
             expected_people,
+            formation_grid_width,
+            formation_grid_height,
         )
 
         capture = cv2.VideoCapture(str(video_path))
@@ -491,6 +504,21 @@ def analyze_video(
             unresolved_positions,
         )
         _save_tracks(tracks_path, frame_results)
+        formations = analyze_formations(
+            frame_results,
+            fps,
+            grid_width=formation_grid_width,
+            grid_height=formation_grid_height,
+        )
+        _save_tracks(formations_path, formations)
+        if formations:
+            logger.info(
+                "关键队形：识别 %d 个，时间点：%s",
+                len(formations),
+                ", ".join(f"{formation['time']:.2f}s" for formation in formations),
+            )
+        else:
+            logger.warning("关键队形：全片没有满足条件的稳定窗口，输出空列表")
 
         # 身份归并完成后重新读取原视频，确保预览展示的是最终 1..N 编号。
         capture.release()
@@ -536,16 +564,25 @@ def analyze_video(
             len(unique_ids),
             failed_frames,
         )
+        formation_summary = (
+            "（"
+            + ", ".join(f"{formation['time']:.2f}s" for formation in formations)
+            + "）"
+            if formations
+            else ""
+        )
         status = (
             f"分析完成：共处理 {frame_id} 帧，在线跟踪产生 {len(raw_unique_ids)} 个 ID，"
             f"已归并为 {len(unique_ids)} 个最终人物 ID，"
             f"已映射到 {GRID_COLUMNS}×{GRID_ROWS} 舞台网格，"
+            f"识别 {len(formations)} 个关键队形{formation_summary}，"
             f"单帧处理失败 {failed_frames} 次。所有结果保存在 `{run_directory}`。"
         )
         return (
             str(preview_path),
             str(tracks_path),
             str(raw_tracks_path),
+            str(formations_path),
             str(calibration_path),
             str(log_path),
             status,
@@ -570,6 +607,7 @@ def analyze_video(
             str(preview_path) if frame_results and preview_path.exists() else None,
             str(tracks_path),
             str(raw_tracks_path) if raw_tracks_path.exists() else None,
+            str(formations_path) if formations_path.exists() else None,
             str(calibration_path) if calibration_path.exists() else None,
             str(log_path),
             status,
@@ -583,16 +621,17 @@ def analyze_video(
 
 
 def build_app() -> gr.Blocks:
-    """构建 AutoDance Lab Phase 1–2 的 Gradio 页面。"""
+    """构建 AutoDance Lab Phase 1–3 的 Gradio 页面。"""
 
     with gr.Blocks(title="AutoDance Lab") as demo:
         gr.Markdown(
             """
             # AutoDance Lab
-            **Phase 1–2：人物追踪、透视标定与 9×9 舞台网格**
+            **Phase 1–3：人物追踪、透视标定与关键队形检测**
 
             上传视频后，在首帧按 **左上 → 右上 → 右下 → 左下** 点击舞台四角。
-            系统会输出最终人物 ID、舞台坐标、网格行列和带透视网格的预览视频。
+            系统会输出最终人物 ID、舞台坐标、带透视网格的预览视频，以及按
+            稳定窗口识别的关键队形 `formations.json`。
             """
         )
         calibration_frame_state = gr.State()
@@ -630,12 +669,28 @@ def build_app() -> gr.Blocks:
                     step=1,
                     label="视频中的固定人数",
                 )
+                with gr.Row():
+                    formation_grid_width_input = gr.Number(
+                        value=20,
+                        minimum=8,
+                        maximum=40,
+                        precision=0,
+                        label="队形网格宽度",
+                    )
+                    formation_grid_height_input = gr.Number(
+                        value=20,
+                        minimum=8,
+                        maximum=40,
+                        precision=0,
+                        label="队形网格高度",
+                    )
                 analyze_button = gr.Button("开始分析", variant="primary")
             with gr.Column():
                 preview_output = gr.Video(label="带 ID 的追踪视频")
                 status_output = gr.Markdown()
                 tracks_output = gr.File(label="下载 tracks.json")
                 raw_tracks_output = gr.File(label="下载 raw_tracks.json（诊断）")
+                formations_output = gr.File(label="下载 formations.json")
                 calibration_output = gr.File(label="下载 calibration.json")
                 log_output = gr.File(label="下载 analysis.log")
 
@@ -674,12 +729,15 @@ def build_app() -> gr.Blocks:
                 tracker_input,
                 confidence_input,
                 expected_people_input,
+                formation_grid_width_input,
+                formation_grid_height_input,
                 calibration_points_state,
             ],
             outputs=[
                 preview_output,
                 tracks_output,
                 raw_tracks_output,
+                formations_output,
                 calibration_output,
                 log_output,
                 status_output,

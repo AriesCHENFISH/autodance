@@ -1,8 +1,8 @@
 # AutoDance Lab
 
 AutoDance Lab 是一个本地运行的舞蹈队形分析工具。当前包含 **Phase 1：
-视频人物检测和追踪** 与 **Phase 2：透视标定和 9×9 舞台网格映射**，
-暂不分析动作、姿态类别、手势或舞步。
+视频人物检测和追踪**、**Phase 2：透视标定和 9×9 舞台网格映射**，
+以及 **Phase 3：关键队形检测**。暂不分析动作、姿态类别、手势或舞步。
 
 ## 当前功能
 
@@ -19,9 +19,12 @@ AutoDance Lab 是一个本地运行的舞蹈队形分析工具。当前包含 **
 - 生成带透视网格、人物框、位置点、ID 和格位的 MP4 预览；
 - 输出最终位置 `tracks.json`、诊断用 `raw_tracks.json` 和可复用的
   `calibration.json`；
+- 在稳定时间窗口中提取关键队形，过滤单人移动、短时抖动、漏检和过多插值；
+- 支持将关键队形离散到 8–40 范围内的自定义网格，默认使用 20×20；
+- 输出关键队形时间点、确认时间、人物 ID 和格位到 `formations.json`；
 - 将异常写入 `analysis.log`，单帧失败时继续处理后续画面。
 
-队形变化检测、SVG 编辑和 PDF/SVG 导出属于后续 Phase，当前版本尚未实现。
+SVG 队形图、队形编辑和 PDF/SVG 导出属于后续 Phase，当前版本尚未实现。
 
 ## 环境要求
 
@@ -74,6 +77,7 @@ data/runs/<时间_任务ID>/
 ├── tracked_preview.mp4
 ├── tracks.json
 ├── raw_tracks.json
+├── formations.json
 ├── calibration.json
 └── analysis.log
 ```
@@ -111,6 +115,49 @@ data/runs/<时间_任务ID>/
 
 `raw_tracks.json` 保存未经最终身份分配的在线 ID、检测框、置信度和脚点，
 用于排查漏检、重复框和在线换 ID，不应直接用于队形变化分析。
+
+## 关键队形检测
+
+Phase 3 从稳定后的 `tracks.json` 提取关键队形，不直接使用在线追踪结果。
+默认判定规则如下：
+
+- 所有人在连续 `0.75` 秒内至少出现 80%；
+- 单个人的插值位置占比不超过 30%；
+- 每个人相对窗口中位位置的 80 分位偏差不超过 1.25 个目标网格单位；
+- 至少两个人相对上一队形移动 2 个目标网格单位，才进入队形转换；
+- 转换后重新稳定满一个窗口，才确认新队形；
+- 单人动作、短暂越界、单帧漂移和未稳定的持续运动不会生成新队形。
+
+界面中的“队形网格宽度/高度”只控制 `formations.json` 的离散坐标范围，
+可选 8–40，默认 20×20；它不会改变 Phase 2 的 9×9 透视标定网格。
+
+`formations.json` 是按时间排序的关键队形数组：
+
+```json
+[
+  {
+    "formation_id": 1,
+    "time": 0.375,
+    "confirmed_at": 0.75,
+    "frame_id": 9,
+    "grid_width": 20,
+    "grid_height": 20,
+    "persons": [
+      {"id": 1, "x": 15, "y": 12},
+      {"id": 2, "x": 5, "y": 12}
+    ]
+  }
+]
+```
+
+`time` 和 `frame_id` 指向稳定窗口的中间位置，适合展示该队形；
+`confirmed_at` 是系统积累足够稳定帧并确认队形的时间。人物 `x`、`y` 是
+从 1 开始、且受 `grid_width` / `grid_height` 约束的队形图坐标，不是视频
+像素坐标，也不是 Phase 2 的连续 `stage_x` / `stage_y`。
+
+进入 Phase 4 前，应在最新运行中确认 `formations.json` 队形数量合理，并在
+`tracked_preview.mp4` 的各个 `time` 时间点目视核对队形和人物 ID。Phase 4
+将以这份已验证的数据生成 SVG，而不会重新检测队形。
 
 ## 透视标定
 
@@ -155,7 +202,7 @@ autodance/                 # 项目名称：AutoDance Lab
 │   ├── tracker.py
 │   └── coordinate.py       # 四点透视坐标转换
 ├── formation/
-│   ├── analyzer.py         # Phase 3 占位
+│   ├── analyzer.py         # 关键队形稳定窗口与转换检测
 │   └── grid.py             # 9×9 网格定位和视频叠加
 ├── visualization/
 │   ├── svg_generator.py    # Phase 4 占位
