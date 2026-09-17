@@ -4,3 +4,4 @@ opencv-python-headless>=4.8
 torch>=2.1
 torchvision>=0.16
 ultralytics>=8.3
+gdown>=5.0

@@ -607,3 +607,209 @@ def relabel_tracked_frames(
                 selected_sources[final_id] = person.person_id
         relabeled.append(sorted(selected.values(), key=lambda person: person.person_id))
     return relabeled
+
+
+@dataclass(frozen=True)
+class KeyframeIdentityAssignment:
+    """跨关键帧身份匹配的诊断结果。"""
+
+    anchor_frame: int | None
+    final_id_count: int
+    iterations: int
+
+
+def _hungarian_square(cost: np.ndarray) -> list[tuple[int, int]]:
+    """求解方阵最小代价指派，返回 ``(row, col)`` 配对。"""
+
+    n = cost.shape[0]
+    inf = 1e18
+    u = np.zeros(n + 1, dtype=np.float64)
+    v = np.zeros(n + 1, dtype=np.float64)
+    p = np.zeros(n + 1, dtype=np.int64)
+    way = np.zeros(n + 1, dtype=np.int64)
+    minv = np.zeros(n + 1, dtype=np.float64)
+    used = np.zeros(n + 1, dtype=bool)
+
+    for i in range(1, n + 1):
+        p[0] = i
+        j0 = 0
+        minv[:] = inf
+        used[:] = False
+        while True:
+            used[j0] = True
+            i0 = p[j0]
+            delta = inf
+            j1 = -1
+            for j in range(1, n + 1):
+                if used[j]:
+                    continue
+                current = cost[i0 - 1, j - 1] - u[i0] - v[j]
+                if current < minv[j]:
+                    minv[j] = current
+                    way[j] = j0
+                if minv[j] < delta:
+                    delta = minv[j]
+                    j1 = j
+            for j in range(n + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+            if p[j0] == 0:
+                break
+        while True:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+            if j0 == 0:
+                break
+
+    pairs = []
+    for j in range(1, n + 1):
+        if p[j] != 0:
+            pairs.append((int(p[j] - 1), int(j - 1)))
+    return pairs
+
+
+def _linear_sum_assignment(cost: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """矩形最小代价指派，支持行列数不等，返回 ``(row, col)`` 索引。"""
+
+    cost = np.asarray(cost, dtype=np.float64)
+    if cost.size == 0:
+        return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
+
+    transpose = cost.shape[0] > cost.shape[1]
+    if transpose:
+        cost = cost.T
+    rows, cols = cost.shape
+
+    size = max(rows, cols)
+    padded = np.full((size, size), 1e12, dtype=np.float64)
+    padded[:rows, :cols] = cost
+    pairs = _hungarian_square(padded)
+
+    valid = [(r, c) for r, c in pairs if r < rows and c < cols]
+    row = np.array([r for r, _c in valid], dtype=np.int64)
+    col = np.array([c for _r, c in valid], dtype=np.int64)
+    if transpose:
+        return col, row
+    return row, col
+
+
+def _l2_normalize(features: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(features, axis=1, keepdims=True)
+    norms[norms < 1e-12] = 1.0
+    return features / norms
+
+
+def _select_keyframe_anchor(
+    features: list[np.ndarray],
+    expected_count: int,
+) -> int:
+    """选择人数齐全且人与人外观最可分的帧作为身份锚点。"""
+
+    best_index = 0
+    best_score = -1.0
+    for index, feature in enumerate(features):
+        count = feature.shape[0]
+        if count < 2:
+            continue
+        similarity = feature @ feature.T
+        np.fill_diagonal(similarity, -1.0)
+        separability = 1.0 - float(np.max(similarity))
+        if count == expected_count:
+            separability += 1.0
+        if separability > best_score:
+            best_score = separability
+            best_index = index
+    return best_index
+
+
+def assign_keyframe_identities(
+    keyframe_features: list[np.ndarray],
+    keyframe_positions: list[np.ndarray],
+    expected_count: int,
+    max_iterations: int = 3,
+) -> tuple[list[np.ndarray], KeyframeIdentityAssignment]:
+    """将离散关键帧中的检测跨帧匹配为全局一致身份。
+
+    以最可分的齐全帧为锚点，用衣着外观嵌入（OSNet 余弦距离）做匈牙利指派，
+    并对每个身份聚合外观原型后迭代重指派，直至收敛。返回每帧的 ID 数组
+    （长度等于该帧检测数，值为 ``1..expected_count`` 的全局身份）。
+
+    Args:
+        keyframe_features: 每个关键帧一个 ``[N_i, D]`` 外观特征矩阵。
+        keyframe_positions: 每个关键帧一个 ``[N_i, 2]`` 二维位置，仅用于
+            确定锚点帧的身份初始排序。
+        expected_count: 视频中的固定人数。
+        max_iterations: 原型迭代精化的最大轮数。
+    """
+
+    if expected_count < 1:
+        raise ValueError("expected_count 必须大于 0")
+    if len(keyframe_features) != len(keyframe_positions):
+        raise ValueError("关键帧特征与位置数量不一致")
+    if not keyframe_features:
+        return [], KeyframeIdentityAssignment(None, 0, 0)
+
+    frame_count = len(keyframe_features)
+    anchor_frame = _select_keyframe_anchor(keyframe_features, expected_count)
+    anchor_count = keyframe_features[anchor_frame].shape[0]
+    if anchor_count == 0:
+        empty_ids = [np.empty(0, dtype=np.int64) for _ in range(frame_count)]
+        return empty_ids, KeyframeIdentityAssignment(anchor_frame, 0, 0)
+
+    ids: list[np.ndarray] = [np.empty(0, dtype=np.int64)] * frame_count
+
+    order = np.argsort(keyframe_positions[anchor_frame][:, 0])
+    anchor_ids = np.empty(anchor_count, dtype=np.int64)
+    anchor_ids[order] = np.arange(1, anchor_count + 1)
+    ids[anchor_frame] = anchor_ids
+
+    prototypes: dict[int, np.ndarray] = {
+        int(identity_id): keyframe_features[anchor_frame][position]
+        for position, identity_id in enumerate(ids[anchor_frame])
+    }
+
+    for _iteration in range(max_iterations):
+        identity_ids = sorted(prototypes)
+        prototype_matrix = np.stack([prototypes[i] for i in identity_ids])
+
+        for frame_index in range(frame_count):
+            if frame_index == anchor_frame:
+                continue
+            feature = keyframe_features[frame_index]
+            count = feature.shape[0]
+            if count == 0:
+                ids[frame_index] = np.empty(0, dtype=np.int64)
+                continue
+            similarity = feature @ prototype_matrix.T
+            cost = 1.0 - similarity
+            row, col = _linear_sum_assignment(cost)
+            frame_ids = np.full(count, -1, dtype=np.int64)
+            frame_ids[row] = np.asarray(identity_ids)[col]
+            ids[frame_index] = frame_ids
+
+        accumulated: dict[int, list[np.ndarray]] = {}
+        for frame_index in range(frame_count):
+            feature = keyframe_features[frame_index]
+            for position, identity_id in enumerate(ids[frame_index]):
+                if identity_id > 0:
+                    accumulated.setdefault(int(identity_id), []).append(
+                        feature[position]
+                    )
+        prototypes = {
+            identity_id: _l2_normalize(
+                np.mean(np.stack(values), axis=0, keepdims=True)
+            )[0]
+            for identity_id, values in accumulated.items()
+            if values
+        }
+
+    return ids, KeyframeIdentityAssignment(
+        anchor_frame=anchor_frame,
+        final_id_count=len(prototypes),
+        iterations=max_iterations,
+    )

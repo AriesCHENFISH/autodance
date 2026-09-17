@@ -13,6 +13,7 @@ import numpy as np
 
 from formation import (
     analyze_formations,
+    analyze_keyframe_formations,
     draw_perspective_grid,
     draw_stabilized_grid_positions,
     person_to_grid_json,
@@ -46,6 +47,7 @@ from visualization import (
     update_formation,
     write_formation_exports,
 )
+from models import get_reid_extractor
 
 
 DATA_DIR = Path("data")
@@ -726,6 +728,27 @@ def analyze_video(
             grid_width=formation_grid_width,
             grid_height=formation_grid_height,
         )
+        if formations:
+            try:
+                reid_extractor = get_reid_extractor()
+                keyframe_payloads = analyze_keyframe_formations(
+                    video_path,
+                    [formation["frame_id"] for formation in formations],
+                    detector,
+                    reid_extractor,
+                    calibration,
+                    int(expected_people),
+                    formation_grid_width,
+                    formation_grid_height,
+                )
+                for formation, payload in zip(formations, keyframe_payloads):
+                    formation["persons"] = payload["persons"]
+                logger.info(
+                    "关键帧身份重建：使用 OSNet 外观匹配重新识别 %d 个队形",
+                    len(formations),
+                )
+            except Exception:
+                logger.exception("关键帧身份重建失败，保留在线归并身份")
         _save_tracks(formations_path, formations)
         if formations:
             logger.info(

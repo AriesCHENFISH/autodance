@@ -54,3 +54,18 @@ class PersonDetector:
         if not results:
             raise RuntimeError("模型未返回推理结果")
         return results[0]
+
+    def process_image(self, frame: np.ndarray) -> Any:
+        """对单张静止画面做独立检测，返回不含追踪 ID 的检测结果。"""
+
+        results = self.model.predict(
+            source=frame,
+            classes=[0],
+            conf=self.confidence,
+            imgsz=self.image_size,
+            iou=self.iou_threshold,
+            verbose=False,
+        )
+        if not results:
+            raise RuntimeError("模型未返回推理结果")
+        return results[0]

@@ -110,6 +110,38 @@ def extract_tracked_persons(result: Any) -> list[TrackedPerson]:
     return sorted(persons, key=lambda person: person.person_id)
 
 
+def extract_detected_persons(result: Any) -> list[TrackedPerson]:
+    """从独立检测结果提取人物，用顺序号作为临时 ID（无在线追踪）。"""
+
+    boxes = getattr(result, "boxes", None)
+    if boxes is None or len(boxes) == 0:
+        return []
+
+    boxes_xyxy = _to_numpy(boxes.xyxy)
+    confidences = _to_numpy(getattr(boxes, "conf", None))
+    keypoints = getattr(result, "keypoints", None)
+    keypoints_xy = _to_numpy(keypoints.xy) if keypoints is not None else None
+    keypoints_conf = _to_numpy(keypoints.conf) if keypoints is not None else None
+
+    persons: list[TrackedPerson] = []
+    for index, box in enumerate(boxes_xyxy):
+        x, y = _foot_position(box, keypoints_xy, keypoints_conf, index)
+        persons.append(
+            TrackedPerson(
+                person_id=index + 1,
+                x=x,
+                y=y,
+                box=tuple(round(float(value)) for value in box),
+                confidence=(
+                    float(confidences[index])
+                    if confidences is not None and index < len(confidences)
+                    else None
+                ),
+            )
+        )
+    return persons
+
+
 def color_for_id(person_id: int) -> tuple[int, int, int]:
     """根据人物 ID 生成稳定且易区分的 BGR 颜色。"""
 
