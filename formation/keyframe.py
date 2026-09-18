@@ -2,14 +2,28 @@
 
 from __future__ import annotations
 
-import math
+from dataclasses import dataclass, replace
 
 import cv2
 import numpy as np
 
 from vision.coordinate import StageCalibration
 from vision.identity import assign_keyframe_identities
-from vision.tracker import extract_detected_persons
+from vision.tracker import (
+    TrackedPerson,
+    draw_tracked_persons,
+    extract_detected_persons,
+)
+
+
+@dataclass
+class KeyframeAnalysis:
+    """关键帧重建结果：队形 payload、原始帧和带身份框的标注帧。"""
+
+    payloads: list[dict]
+    frame_ids: list[int]
+    original_frames: list[np.ndarray | None]
+    annotated_frames: list[np.ndarray | None]
 
 
 def _scale_coordinate(value: float, source_size: int, target_size: int) -> float:
@@ -58,13 +72,14 @@ def analyze_keyframe_formations(
     grid_height: int,
     source_grid_width: int = 9,
     source_grid_height: int = 9,
-) -> list[dict]:
-    """对每个关键帧独立检测并跨帧匹配身份，返回逐帧 persons。
+) -> KeyframeAnalysis:
+    """对每个关键帧独立检测并跨帧匹配身份，返回队形 payload 与帧图。
 
-    返回列表长度与 ``frame_ids`` 一致，每个元素形如
-    ``{"frame_id": int, "persons": [{"id": int, "x": int, "y": int}, ...]}``。
+    ``payloads`` 中每个元素形如
+    ``{"frame_id": int, "persons": [{"id": int, "x": int, "y": int}, ...]}``，
     人物 ``x`` / ``y`` 是从 1 开始的离散队形格位；在舞台之外或未匹配到
-    身份的检测会被省略。
+    身份的检测会被省略。``original_frames`` 与 ``annotated_frames`` 是
+    对应的 BGR 原始帧与带识别身份框的标注帧。
     """
 
     capture = cv2.VideoCapture(str(video_path))
@@ -75,7 +90,8 @@ def analyze_keyframe_formations(
         features: list[np.ndarray] = []
         positions: list[np.ndarray] = []
         stages: list[list[tuple[float, float]]] = []
-        detected_counts: list[int] = []
+        frames: list[np.ndarray | None] = []
+        detected: list[list[TrackedPerson]] = []
 
         for frame_id in frame_ids:
             frame = _read_frame(capture, frame_id)
@@ -83,7 +99,8 @@ def analyze_keyframe_formations(
                 features.append(np.zeros((0, 512), dtype=np.float32))
                 positions.append(np.zeros((0, 2), dtype=np.float32))
                 stages.append([])
-                detected_counts.append(0)
+                frames.append(None)
+                detected.append([])
                 continue
 
             result = detector.process_image(frame)
@@ -101,10 +118,11 @@ def analyze_keyframe_formations(
             features.append(frame_features)
             positions.append(np.asarray(frame_positions, dtype=np.float32).reshape(-1, 2))
             stages.append(frame_stages)
-            detected_counts.append(len(persons))
+            frames.append(frame)
+            detected.append(persons)
 
         if not features:
-            return []
+            return KeyframeAnalysis([], list(frame_ids), [], [])
 
         ids_per_frame, _assignment = assign_keyframe_identities(
             features, positions, expected_count
@@ -112,10 +130,27 @@ def analyze_keyframe_formations(
 
         epsilon = 1e-5
         payloads: list[dict] = []
+        original_frames: list[np.ndarray | None] = []
+        annotated_frames: list[np.ndarray | None] = []
+
         for index, frame_id in enumerate(frame_ids):
+            frame = frames[index]
+            original_frames.append(frame.copy() if frame is not None else None)
+
+            relabeled: list[TrackedPerson] = []
+            if frame is not None:
+                for position_index, identity_id in enumerate(ids_per_frame[index]):
+                    if identity_id <= 0:
+                        continue
+                    person = detected[index][position_index]
+                    relabeled.append(replace(person, person_id=int(identity_id)))
+                annotated = draw_tracked_persons(frame, relabeled, draw_position=True)
+                annotated_frames.append(annotated)
+            else:
+                annotated_frames.append(None)
+
             persons = []
-            frame_ids_for_payload = ids_per_frame[index]
-            for position_index, identity_id in enumerate(frame_ids_for_payload):
+            for position_index, identity_id in enumerate(ids_per_frame[index]):
                 if identity_id <= 0:
                     continue
                 stage_x, stage_y = stages[index][position_index]
@@ -136,6 +171,12 @@ def analyze_keyframe_formations(
                 )
             persons.sort(key=lambda item: item["id"])
             payloads.append({"frame_id": int(frame_id), "persons": persons})
-        return payloads
+
+        return KeyframeAnalysis(
+            payloads=payloads,
+            frame_ids=list(frame_ids),
+            original_frames=original_frames,
+            annotated_frames=annotated_frames,
+        )
     finally:
         capture.release()

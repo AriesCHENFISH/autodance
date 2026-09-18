@@ -6,16 +6,17 @@ import logging
 from pathlib import Path
 import traceback
 import uuid
+import zipfile
 
 import cv2
 import gradio as gr
 import numpy as np
 
 from formation import (
+    KeyframeAnalysis,
     analyze_formations,
     analyze_keyframe_formations,
     draw_perspective_grid,
-    draw_stabilized_grid_positions,
     person_to_grid_json,
     stabilize_grid_tracks,
 )
@@ -24,7 +25,6 @@ from vision import (
     PersonDetector,
     StageCalibration,
     assign_fixed_identities,
-    draw_tracked_persons,
     extract_tracked_persons,
 )
 from vision import (
@@ -99,6 +99,42 @@ def _save_tracks(
 
     with output_path.open("w", encoding="utf-8") as file:
         json.dump(frames, file, ensure_ascii=False, indent=2)
+
+
+def _save_keyframe_images(
+    analysis: KeyframeAnalysis,
+    zip_path: Path,
+) -> tuple[list, str | None]:
+    """保存关键帧原始帧与带身份框的标注帧，返回标注帧 RGB 列表。"""
+
+    gallery: list = []
+    keyframes_dir = zip_path.parent / "keyframes"
+    for index, frame_id in enumerate(analysis.frame_ids, start=1):
+        annotated = analysis.annotated_frames[index - 1]
+        if annotated is None:
+            continue
+        keyframes_dir.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(
+            str(keyframes_dir / f"keyframe_{index:03d}_frame{frame_id}.png"),
+            annotated,
+        )
+        original = analysis.original_frames[index - 1]
+        if original is not None:
+            cv2.imwrite(
+                str(
+                    keyframes_dir
+                    / f"keyframe_{index:03d}_frame{frame_id}_original.png"
+                ),
+                original,
+            )
+        gallery.append(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB))
+
+    if not gallery:
+        return [], None
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(keyframes_dir.glob("*.png")):
+            archive.write(path, arcname=f"keyframes/{path.name}")
+    return gallery, str(zip_path)
 
 
 def _raw_person_json(person) -> dict:
@@ -485,23 +521,6 @@ def save_formation_editor(
         return None, None, None, f"导出失败：{error}"
 
 
-def _open_video_writer(
-    output_path: Path, fps: float, width: int, height: int
-) -> cv2.VideoWriter:
-    """创建 MP4 标注视频写入器，创建失败时抛出可记录的异常。"""
-
-    writer = cv2.VideoWriter(
-        str(output_path),
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        fps,
-        (width, height),
-    )
-    if not writer.isOpened():
-        writer.release()
-        raise RuntimeError("无法创建预览视频，请检查 OpenCV 的视频编码支持")
-    return writer
-
-
 def analyze_video(
     video_path: str | None,
     tracker_name: str,
@@ -511,6 +530,7 @@ def analyze_video(
     formation_grid_height: int = 20,
     calibration_points: list | None = None,
 ) -> tuple[
+    list,
     str | None,
     str | None,
     str | None,
@@ -519,12 +539,13 @@ def analyze_video(
     str | None,
     str,
 ]:
-    """分析视频并返回预览、轨迹、队形、标定、日志和状态信息。"""
+    """分析视频并返回关键帧帧图、轨迹、队形、标定、日志和状态信息。"""
 
     if not video_path:
-        return None, None, None, None, None, None, "请先上传一个 MP4 视频。"
+        return [], None, None, None, None, None, None, "请先上传一个 MP4 视频。"
     if calibration_points is None or len(calibration_points) != 4:
         return (
+            [],
             None,
             None,
             None,
@@ -536,23 +557,24 @@ def analyze_video(
     formation_grid_width = int(formation_grid_width)
     formation_grid_height = int(formation_grid_height)
     if not 8 <= formation_grid_width <= 40 or not 8 <= formation_grid_height <= 40:
-        return None, None, None, None, None, None, "队形网格宽度和高度必须在 8 到 40 之间。"
+        return [], None, None, None, None, None, None, "队形网格宽度和高度必须在 8 到 40 之间。"
 
     run_directory = _create_run_directory()
     tracks_path = run_directory / "tracks.json"
     formations_path = run_directory / "formations.json"
     raw_tracks_path = run_directory / "raw_tracks.json"
     calibration_path = run_directory / "calibration.json"
-    preview_path = run_directory / "tracked_preview.mp4"
+    keyframes_zip_path = run_directory / "keyframes.zip"
     log_path = run_directory / "analysis.log"
     logger = _create_logger(log_path)
     capture: cv2.VideoCapture | None = None
-    writer: cv2.VideoWriter | None = None
     frame_results: list[dict] = []
     tracked_frames = []
     final_tracked_frames = []
     frame_descriptors: list[dict] = []
     failed_frames = 0
+    keyframe_gallery: list = []
+    keyframe_zip: str | None = None
 
     try:
         logger.info("开始分析视频：%s", video_path)
@@ -731,7 +753,7 @@ def analyze_video(
         if formations:
             try:
                 reid_extractor = get_reid_extractor()
-                keyframe_payloads = analyze_keyframe_formations(
+                keyframe_analysis = analyze_keyframe_formations(
                     video_path,
                     [formation["frame_id"] for formation in formations],
                     detector,
@@ -741,11 +763,18 @@ def analyze_video(
                     formation_grid_width,
                     formation_grid_height,
                 )
-                for formation, payload in zip(formations, keyframe_payloads):
+                for formation, payload in zip(
+                    formations, keyframe_analysis.payloads
+                ):
                     formation["persons"] = payload["persons"]
+                keyframe_gallery, keyframe_zip = _save_keyframe_images(
+                    keyframe_analysis, keyframes_zip_path
+                )
                 logger.info(
-                    "关键帧身份重建：使用 OSNet 外观匹配重新识别 %d 个队形",
+                    "关键帧身份重建：使用 OSNet 外观匹配重新识别 %d 个队形，"
+                    "导出 %d 张关键帧图",
                     len(formations),
+                    len(keyframe_gallery),
                 )
             except Exception:
                 logger.exception("关键帧身份重建失败，保留在线归并身份")
@@ -758,31 +787,6 @@ def analyze_video(
             )
         else:
             logger.warning("关键队形：全片没有满足条件的稳定窗口，输出空列表")
-
-        # 身份归并完成后重新读取原视频，确保预览展示的是最终 1..N 编号。
-        capture.release()
-        capture = cv2.VideoCapture(str(video_path))
-        if not capture.isOpened():
-            raise RuntimeError("身份归并后无法重新打开原视频生成预览")
-        writer = _open_video_writer(preview_path, fps, width, height)
-        rendered_frames = 0
-        for current_frame_id, persons in enumerate(final_tracked_frames):
-            success, frame = capture.read()
-            if not success:
-                raise RuntimeError(
-                    f"生成最终预览时只能读取 {rendered_frames}/{frame_id} 帧"
-                )
-            annotated = draw_perspective_grid(frame, calibration)
-            annotated = draw_tracked_persons(
-                annotated, persons, draw_position=False
-            )
-            annotated = draw_stabilized_grid_positions(
-                annotated,
-                frame_results[current_frame_id],
-                calibration,
-            )
-            writer.write(annotated)
-            rendered_frames += 1
 
         unique_ids = {
             person["id"]
@@ -818,7 +822,8 @@ def analyze_video(
             f"单帧处理失败 {failed_frames} 次。所有结果保存在 `{run_directory}`。"
         )
         return (
-            str(preview_path),
+            keyframe_gallery,
+            keyframe_zip,
             str(tracks_path),
             str(raw_tracks_path),
             str(formations_path),
@@ -843,7 +848,8 @@ def analyze_video(
         _save_tracks(tracks_path, frame_results)
         status = f"分析未能完成：{error}。已保留部分 JSON 和错误日志。"
         return (
-            str(preview_path) if frame_results and preview_path.exists() else None,
+            keyframe_gallery,
+            keyframe_zip,
             str(tracks_path),
             str(raw_tracks_path) if raw_tracks_path.exists() else None,
             str(formations_path) if formations_path.exists() else None,
@@ -854,8 +860,6 @@ def analyze_video(
     finally:
         if capture is not None:
             capture.release()
-        if writer is not None:
-            writer.release()
         _close_logger(logger)
 
 
@@ -869,8 +873,9 @@ def build_app() -> gr.Blocks:
             **Phase 1–4：人物追踪、关键队形检测、编辑与 SVG 导出**
 
             上传视频后，在首帧按 **左上 → 右上 → 右下 → 左下** 点击舞台四角。
-            系统会输出最终人物 ID、舞台坐标、带透视网格的预览视频，以及按
-            稳定窗口识别的关键队形 `formations.json`。
+            系统会检测关键队形，用外观重识别为每个人分配一致 ID，并输出
+            带识别 ID 框的有效队形帧，以及按稳定窗口识别的关键队形
+            `formations.json`。
             """
         )
         calibration_frame_state = gr.State()
@@ -926,7 +931,12 @@ def build_app() -> gr.Blocks:
                     )
                 analyze_button = gr.Button("开始分析", variant="primary")
             with gr.Column():
-                preview_output = gr.Video(label="带 ID 的追踪视频")
+                keyframes_gallery = gr.Gallery(
+                    label="有效队形帧（带识别 ID）",
+                    columns=3,
+                    height=420,
+                )
+                keyframes_output = gr.File(label="下载关键帧帧图（ZIP）")
                 status_output = gr.Markdown()
                 tracks_output = gr.File(label="下载 tracks.json")
                 raw_tracks_output = gr.File(label="下载 raw_tracks.json（诊断）")
@@ -1116,7 +1126,8 @@ def build_app() -> gr.Blocks:
                 calibration_points_state,
             ],
             outputs=[
-                preview_output,
+                keyframes_gallery,
+                keyframes_output,
                 tracks_output,
                 raw_tracks_output,
                 formations_output,
