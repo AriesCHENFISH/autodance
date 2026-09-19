@@ -18,6 +18,7 @@ from formation import (
     analyze_keyframe_formations,
     draw_perspective_grid,
     person_to_grid_json,
+    regularize_formations,
     stabilize_grid_tracks,
 )
 from vision import (
@@ -25,6 +26,7 @@ from vision import (
     PersonDetector,
     StageCalibration,
     assign_fixed_identities,
+    auto_calibrate_stage,
     extract_tracked_persons,
 )
 from vision import (
@@ -245,13 +247,27 @@ def prepare_calibration(
         return None, None, [], f"无法准备标定画面：{error}"
 
 
+def _nearest_calibration_point(
+    points: list[list[float]],
+    x: float,
+    y: float,
+) -> int:
+    """返回距 (x, y) 最近的标定角点索引。"""
+
+    distances = [
+        (float(point[0]) - x) ** 2 + (float(point[1]) - y) ** 2
+        for point in points
+    ]
+    return int(min(range(len(distances)), key=lambda index: distances[index]))
+
+
 def add_calibration_point(
     original_rgb: np.ndarray | None,
     points: list | None,
     x: float,
     y: float,
 ) -> tuple[np.ndarray | None, list, str]:
-    """向标定状态添加一个点，便于 UI 回调和单元测试共用。"""
+    """向标定状态添加一个点；四点已满时改为移动最近的角点。"""
 
     if original_rgb is None:
         return None, [], "请先上传视频。"
@@ -259,10 +275,12 @@ def add_calibration_point(
         [float(point[0]), float(point[1])] for point in (points or [])
     ]
     if len(selected) >= 4:
+        index = _nearest_calibration_point(selected, x, y)
+        selected[index] = [float(x), float(y)]
         return (
             _render_calibration_frame(original_rgb, selected),
             selected,
-            "四点标定已完成；如需修改，请点击“重新标定”。",
+            f"已把第 {index + 1} 个角点移动到新位置。",
         )
 
     selected.append([float(x), float(y)])
@@ -318,6 +336,33 @@ def reset_calibration(
     if original_rgb is None:
         return None, [], "请先上传视频。"
     return original_rgb.copy(), [], "已清空；请点击第 1 个点：舞台左上角。"
+
+
+def auto_calibrate(
+    video_path: str | None,
+) -> tuple[np.ndarray | None, list, str]:
+    """根据舞者脚点轨迹自动拟合对称梯形舞台四角。"""
+
+    if not video_path:
+        return None, [], "请先上传视频。"
+    try:
+        detector = PersonDetector(
+            model_name=MODEL_NAME,
+            tracker_name="Dance BoT-SORT",
+            confidence=0.10,
+            image_size=INFERENCE_IMAGE_SIZE,
+            iou_threshold=INFERENCE_IOU_THRESHOLD,
+        )
+        points = auto_calibrate_stage(video_path, detector)
+        first_frame = _read_first_video_frame(video_path)
+        rendered = _render_calibration_frame(first_frame, points)
+        return (
+            rendered,
+            points,
+            "自动标定完成：已生成对称梯形舞台，可点击画布微调最近角点。",
+        )
+    except Exception as error:
+        return None, [], f"自动标定失败：{error}"
 
 
 def _uploaded_path(value: object) -> Path:
@@ -778,6 +823,7 @@ def analyze_video(
                 )
             except Exception:
                 logger.exception("关键帧身份重建失败，保留在线归并身份")
+        formations = regularize_formations(formations)
         _save_tracks(formations_path, formations)
         if formations:
             logger.info(
@@ -886,7 +932,8 @@ def build_app() -> gr.Blocks:
                 video_input = gr.Video(label="上传舞蹈视频")
                 gr.Markdown(
                     "### 透视标定\n"
-                    "依次点击舞台区域的左上、右上、右下、左下四个角点。"
+                    "点击“自动标定”可从舞者轨迹拟合对称舞台四角；也可手动依次点击"
+                    "左上、右上、右下、左下四个角点。四点齐后可点击画布微调最近角点。"
                 )
                 calibration_image = gr.Image(
                     label="点击首帧完成四点标定",
@@ -894,7 +941,9 @@ def build_app() -> gr.Blocks:
                     interactive=False,
                 )
                 calibration_status = gr.Markdown("请先上传视频。")
-                reset_calibration_button = gr.Button("重新标定")
+                with gr.Row():
+                    auto_calibrate_button = gr.Button("自动标定", variant="primary")
+                    reset_calibration_button = gr.Button("重新标定")
                 tracker_input = gr.Radio(
                     choices=["Dance BoT-SORT", "ByteTrack", "BoT-SORT"],
                     value="Dance BoT-SORT",
@@ -1028,6 +1077,15 @@ def build_app() -> gr.Blocks:
         reset_calibration_button.click(
             fn=reset_calibration,
             inputs=[calibration_frame_state],
+            outputs=[
+                calibration_image,
+                calibration_points_state,
+                calibration_status,
+            ],
+        )
+        auto_calibrate_button.click(
+            fn=auto_calibrate,
+            inputs=[video_input],
             outputs=[
                 calibration_image,
                 calibration_points_state,

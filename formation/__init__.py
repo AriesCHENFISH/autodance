@@ -2,6 +2,7 @@
 
 from .analyzer import analyze_formations
 from .keyframe import KeyframeAnalysis, analyze_keyframe_formations
+from .regularize import regularize_formation, regularize_formations
 
 from .grid import (
     GridPosition,
@@ -17,6 +18,8 @@ __all__ = [
     "analyze_formations",
     "analyze_keyframe_formations",
     "KeyframeAnalysis",
+    "regularize_formation",
+    "regularize_formations",
     "draw_grid_positions",
     "draw_perspective_grid",
     "draw_stabilized_grid_positions",
